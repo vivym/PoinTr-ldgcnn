@@ -4,6 +4,7 @@ import torch.nn as nn
 from timm.models.layers import DropPath,trunc_normal_
 
 from .dgcnn_group import DGCNN_Grouper
+from .ldgcnn_group import LDGCNN_Grouper
 from utils.logger import *
 import numpy as np
 # from knn_cuda import KNN
@@ -41,7 +42,7 @@ def square_distance(src, dst):
     dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
     dist += torch.sum(src ** 2, -1).view(B, N, 1)
     dist += torch.sum(dst ** 2, -1).view(B, 1, M)
-    return dist   
+    return dist
 
 def get_knn_index(coor_q, coor_k=None):
     coor_k = coor_k if coor_k is not None else coor_q
@@ -56,7 +57,7 @@ def get_knn_index(coor_q, coor_k=None):
         idx_base = torch.arange(0, batch_size, device=coor_q.device).view(-1, 1, 1) * num_points_k
         idx = idx + idx_base
         idx = idx.view(-1)
-    
+
     return idx  # bs*k*np
 
 def get_graph_feature(x, knn_index, x_q=None):
@@ -201,7 +202,7 @@ class DecoderBlock(nn.Module):
             knn_f = knn_f.max(dim=1, keepdim=False)[0]
             q_1 = torch.cat([q_1, knn_f], dim=-1)
             q_1 = self.merge_map(q_1)
-        
+
         q = q + self.drop_path(q_1)
 
         norm_q = self.norm_q(q)
@@ -255,7 +256,7 @@ class Block(nn.Module):
             knn_f = knn_f.max(dim=1, keepdim=False)[0]
             x_1 = torch.cat([x_1, knn_f], dim=-1)
             x_1 = self.merge_map(x_1)
-        
+
         x = x + self.drop_path(x_1)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
@@ -266,16 +267,19 @@ class PCTransformer(nn.Module):
     """ Vision Transformer with support for point cloud completion
     """
     def __init__(self, in_chans=3, embed_dim=768, depth=[6, 6], num_heads=6, mlp_ratio=2., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                        num_query = 224, knn_layer = -1):
+                        num_query = 224, knn_layer = -1, use_ldgcnn = False):
         super().__init__()
 
         self.num_features = self.embed_dim = embed_dim
-        
+
         self.knn_layer = knn_layer
 
         print_log(' Transformer with knn_layer %d' % self.knn_layer, logger='MODEL')
 
-        self.grouper = DGCNN_Grouper()  # B 3 N to B C(3) N(128) and B C(128) N(128)
+        if use_ldgcnn:
+            self.grouper = LDGCNN_Grouper()  # B 3 N to B C(3) N(128) and B C(128) N(128)
+        else:
+            self.grouper = DGCNN_Grouper()  # B 3 N to B C(3) N(128) and B C(128) N(128)
 
         self.pos_embed = nn.Sequential(
             nn.Conv1d(in_chans, 128, 1),
@@ -365,8 +369,8 @@ class PCTransformer(nn.Module):
         normal_coor = 2 * ((coor - coor.min()) / (coor.max() - coor.min())) - 1 
 
         # define sin wave freq
-        freqs = torch.arange(D, dtype=torch.float).cuda() 
-        freqs = np.pi * (2**freqs)       
+        freqs = torch.arange(D, dtype=torch.float).cuda()
+        freqs = np.pi * (2**freqs)
 
         freqs = freqs.view(*[1]*len(normal_coor.shape), -1) # 1 x 1 x 1 x D
         normal_coor = normal_coor.unsqueeze(-1) # B x 3 x N x 1
@@ -386,7 +390,7 @@ class PCTransformer(nn.Module):
         '''
         # build point proxy
         bs = inpc.size(0)
-        coor, f = self.grouper(inpc.transpose(1,2).contiguous()) 
+        coor, f = self.grouper(inpc.transpose(1,2).contiguous())
         knn_index = get_knn_index(coor)
         # NOTE: try to use a sin wave  coor B 3 N, change the pos_embed input dim
         # pos = self.pos_encoding_sin_wave(coor).transpose(1,2)
@@ -405,7 +409,7 @@ class PCTransformer(nn.Module):
         # build the query feature for decoder
         # global_feature  = x[:, 0] # B C
 
-        global_feature = self.increase_dim(x.transpose(1,2)) # B 1024 N 
+        global_feature = self.increase_dim(x.transpose(1,2)) # B 1024 N
         global_feature = torch.max(global_feature, dim=-1)[0] # B 1024
 
         coarse_point_cloud = self.coarse_pred(global_feature).reshape(bs, -1, 3)  #  B M C(3)
@@ -414,8 +418,8 @@ class PCTransformer(nn.Module):
         cross_knn_index = get_knn_index(coor_k=coor, coor_q=coarse_point_cloud.transpose(1, 2).contiguous())
 
         query_feature = torch.cat([
-            global_feature.unsqueeze(1).expand(-1, self.num_query, -1), 
-            coarse_point_cloud], dim=-1) # B M C+3 
+            global_feature.unsqueeze(1).expand(-1, self.num_query, -1),
+            coarse_point_cloud], dim=-1) # B M C+3
         q = self.mlp_query(query_feature.transpose(1,2)).transpose(1,2) # B M C 
         # decoder
         for i, blk in enumerate(self.decoder):
@@ -425,4 +429,3 @@ class PCTransformer(nn.Module):
                 q = blk(q, x)
 
         return q, coarse_point_cloud
-
